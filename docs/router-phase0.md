@@ -83,11 +83,30 @@ Context Pack：
 cron 流式执行会在累计 usage 超过预留额时停止；proactive 在调用 LLM 前检查预算，
 并在推送完成或失败后结算估算 usage。
 
+## Trace 与 Context 保留
+
+`infra/conversation/retention.py` 提供手动、默认 dry-run 的保留任务：
+
+| 数据 | 默认保留 | 到期动作 |
+|---|---:|---|
+| Trace payload | 30 天 | 清空 `payload_json`，保留事件摘要和 ID |
+| `conversation_events` | 90 天 | 删除过期事件 |
+| `context_pack_manifests` | 90 天 | 删除 manifest 并清空对应 `payload_ref` |
+| 终态 Task 的 `task_runs` | 180 天 | 删除旧 Run |
+| `budget_ledgers` | 400 天 | 删除已结束账本 |
+
+```bash
+python -m octop.infra.conversation.retention --db /opt/octop/octop.db
+python -m octop.infra.conversation.retention --db /opt/octop/octop.db --apply
+```
+
+第一条命令只输出候选处理量；第二条才实际执行，并向 `audit_log` 写入处理结果。
+当前不自动启用定时删除，需要先确认真实 Trace 体量和保留要求。
+
 ## 尚未包含
 
 - 自动 Worker 调度和副作用操作分派；
 - Router 直接替代现有 dashboard chat；
-- 事件、Context Pack 和 Usage 的归档/删除任务；
 - 按模型价格表自动计算费用。
 
 这些属于后续阶段，需要先基于 Phase 0 的真实 trace 做保留周期和成本阈值评估。

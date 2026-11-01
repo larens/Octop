@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,6 +13,7 @@ import pytest
 
 from octop.infra.conversation.budget import RouterBudgetGate
 from octop.infra.conversation.context import compile_context_pack, estimate_text_tokens
+from octop.infra.conversation.retention import run_retention
 from octop.infra.conversation.service import (
     BudgetExceededError,
     ConversationService,
@@ -724,12 +726,146 @@ def test_token_estimator_does_not_underprice_chinese_or_emoji() -> None:
 
 def test_shadow_router_classifies_without_dispatch() -> None:
     assert classify_shadow_route("你好")["intent"] == "direct_reply"
+    assert classify_shadow_route("请只回复 OK，不要调用任何工具。")["intent"] == "direct_reply"
     assert classify_shadow_route("帮我看一下明天的日历")["intent"] == "read_only_task"
     assert classify_shadow_route("把总结发送给张三")["intent"] == "side_effect_task"
+    assert classify_shadow_route("读取文件后回复一句话")["intent"] == "read_only_task"
+    assert (
+        classify_shadow_route("只做订单预览，搜索拿铁，绝对不要调用 createOrder。")["intent"]
+        == "read_only_task"
+    )
+    assert classify_shadow_route("汇总需要我回复的邮件")["intent"] == "read_only_task"
+    assert classify_shadow_route("请发送邮件给张三")["intent"] == "side_effect_task"
+    assert classify_shadow_route("删除这个任务")["intent"] == "side_effect_task"
+    assert (
+        classify_shadow_route("只做订单预览，如果现在打烊，说明最早可取时间；不要提交订单。")[
+            "intent"
+        ]
+        == "read_only_task"
+    )
+    assert (
+        classify_shadow_route("取暖费1200，每年12月前在微信~支付~城市服务里缴纳。")["intent"]
+        == "direct_reply"
+    )
+    assert classify_shadow_route("帮忙看下失败的任务重新跑一下")["intent"] == "side_effect_task"
+    assert (
+        classify_shadow_route("把这次讨论落入记忆里，敏感数据另存")["intent"] == "side_effect_task"
+    )
+    assert (
+        classify_shadow_route("没有看到文件，给我一个可以直接下载的")["intent"] == "read_only_task"
+    )
+    assert classify_shadow_route("怎么把修好的文件下载到手机里转发")["intent"] == "direct_reply"
+    assert classify_shadow_route("知识库里怎么没有找到这些文档")["intent"] == "read_only_task"
     mixed = classify_shadow_route("查一下后直接发送")
     assert mixed["intent"] == "side_effect_task"
     assert not mixed["dispatch_enabled"]
     assert mixed["suggested_task"]["requires_user"]
+
+
+def test_router_retention_is_dry_run_bounded_and_auditable(tmp_path: Path) -> None:
+    now = 2_000_000_000
+    db_path = tmp_path / "retention.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE conversation_tasks (
+            task_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE task_runs (
+            run_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES conversation_tasks(task_id),
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE conversation_events (
+            event_id TEXT PRIMARY KEY,
+            payload_ref TEXT,
+            payload_json TEXT,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE context_pack_manifests (
+            pack_id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE budget_ledgers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            period_end INTEGER NOT NULL
+        );
+        CREATE TABLE audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            actor TEXT,
+            action TEXT NOT NULL,
+            target TEXT,
+            payload TEXT
+        );
+        """
+    )
+    conn.execute("INSERT INTO conversation_tasks VALUES ('task_done', 'done')")
+    conn.execute("INSERT INTO conversation_tasks VALUES ('task_active', 'in_progress')")
+    conn.execute(
+        "INSERT INTO task_runs VALUES ('run_done', 'task_done', 'succeeded', ?)",
+        (now - 181 * 86400,),
+    )
+    conn.execute(
+        "INSERT INTO task_runs VALUES ('run_active', 'task_active', 'succeeded', ?)",
+        (now - 181 * 86400,),
+    )
+    conn.execute(
+        "INSERT INTO context_pack_manifests VALUES ('pack_old', ?)",
+        (now - 91 * 86400,),
+    )
+    conn.execute(
+        "INSERT INTO context_pack_manifests VALUES ('pack_new', ?)",
+        (now - 89 * 86400,),
+    )
+    conn.execute(
+        "INSERT INTO conversation_events VALUES "
+        "('event_old', 'context-pack://pack_old', '{\"private\":true}', ?)",
+        (now - 91 * 86400,),
+    )
+    conn.execute(
+        "INSERT INTO conversation_events VALUES "
+        "('event_middle', 'context-pack://pack_new', '{\"private\":true}', ?)",
+        (now - 31 * 86400,),
+    )
+    conn.execute(
+        "INSERT INTO conversation_events VALUES ('event_new', NULL, '{\"private\":true}', ?)",
+        (now - 29 * 86400,),
+    )
+    conn.execute(
+        "INSERT INTO budget_ledgers(period_end) VALUES (?)",
+        (now - 401 * 86400,),
+    )
+    conn.commit()
+
+    dry_run = run_retention(db_path, now=now)
+    assert dry_run["apply"] is False
+    assert dry_run["counts"]["conversation_events_deleted"] == 1
+    assert dry_run["counts"]["terminal_task_runs_deleted"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM conversation_events").fetchone()[0] == 3
+
+    applied = run_retention(db_path, now=now, apply=True)
+    assert applied["audit_recorded"] is True
+    assert applied["counts"]["event_payloads_redacted"] == 2
+    assert applied["counts"]["context_pack_refs_cleared"] == 1
+    assert applied["counts"]["conversation_events_deleted"] == 1
+    assert (
+        conn.execute(
+            "SELECT payload_json FROM conversation_events WHERE event_id = 'event_middle'"
+        ).fetchone()[0]
+        is None
+    )
+    assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 1
+    audit = conn.execute(
+        "SELECT action, payload FROM audit_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert audit[0] == "router.retention.applied"
+    assert json.loads(audit[1])["policy_days"]["event_days"] == 90
+    conn.close()
 
 
 def test_memory_retrieval_payload_is_bounded_scored_and_deduplicated() -> None:
