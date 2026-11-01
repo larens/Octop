@@ -256,6 +256,9 @@ def record_turn_usage(
     thread_id: str,
     usage: dict[str, Any],
     source: str = "chat",
+    trace_id: str | None = None,
+    task_id: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Append one cache-aware turn row without allowing bad data to break chat."""
     normalized = normalize_usage(usage)
@@ -273,4 +276,7 @@ def record_turn_usage(
             reasoning_tokens=normalized["reasoning_tokens"],
             model_calls=max(1, _token_int(usage.get("model_calls"))),
             source=source,
+            trace_id=trace_id,
+            task_id=task_id,
+            run_id=run_id,
         )

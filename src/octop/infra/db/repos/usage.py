@@ -157,6 +157,9 @@ class UsageRepo:
         model: str = "",
         thread_id: str = "",
         source: str = "chat",
+        trace_id: str | None = None,
+        task_id: str | None = None,
+        run_id: str | None = None,
         ts: int | None = None,
     ) -> int:
         """Append one usage row. Returns the new row id."""
@@ -168,8 +171,9 @@ class UsageRepo:
                     ts, agent_id, user_id, thread_id, model,
                     input_tokens, uncached_input_tokens,
                     cache_read_tokens, cache_write_tokens,
-                    output_tokens, reasoning_tokens, total_tokens, model_calls, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    output_tokens, reasoning_tokens, total_tokens, model_calls, source,
+                    trace_id, task_id, run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ts or now_ts(),
@@ -188,6 +192,9 @@ class UsageRepo:
                     int(input_tokens) + int(output_tokens),
                     int(model_calls),
                     source,
+                    trace_id,
+                    task_id,
+                    run_id,
                 ),
             )
 

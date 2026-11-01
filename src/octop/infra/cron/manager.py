@@ -318,11 +318,18 @@ class CronManager:
         await self._unschedule(cron_id)
 
     def _make_job(self, row: Any) -> CronJob:
+        from octop.infra.conversation.budget import RouterBudgetGate  # noqa: PLC0415
+
         return CronJob.from_row(
             row,
             delivery_service=self._delivery_service,
             cron_repo=self._repos.cron_repo,
             audit_repo=self._repos.audit_repo,
+            budget_gate=RouterBudgetGate(
+                self._repos.db,
+                self._repos.settings_repo,
+                timezone_name=self._timezone,
+            ),
         )
 
     def _on_job_missed(self, event: JobEvent) -> None:

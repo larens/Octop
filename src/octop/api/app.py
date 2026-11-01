@@ -213,6 +213,7 @@ def build_app(server: OctopServer) -> FastAPI:
         voice,
         workspace,
     )
+    from octop.api.routers.conversation_router import router as conversation_router
     from octop.api.routers.decision import router as decision_router
     from octop.api.routers.filesystem import router as filesystem_router
     from octop.api.routers.observability import router as observability_router
@@ -252,6 +253,7 @@ def build_app(server: OctopServer) -> FastAPI:
             _RouterMount(channels.router, "/api", ["channels"]),
             _RouterMount(cron.router, "/api", ["cron"]),
             _RouterMount(settings.router, "/api", ["settings"]),
+            _RouterMount(conversation_router, "/api", ["conversation"]),
             _RouterMount(decision_router, "/api", ["settings"]),
             _RouterMount(envs.router, "/api", ["envs"]),
             _RouterMount(search.router, "/api", ["search"]),

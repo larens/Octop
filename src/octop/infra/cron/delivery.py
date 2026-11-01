@@ -45,6 +45,7 @@ class CronDeliveryCommand:
     task_type: CronTaskType
     model: str | None
     mcp_servers: tuple[str, ...]
+    budget_lease: Any | None = None
 
 
 class CronDeliveryService:
@@ -65,10 +66,13 @@ class CronDeliveryService:
         """Retarget projection and locale lookups after a control-plane swap."""
         self._repos = repos
 
-    async def deliver(self, command: CronDeliveryCommand) -> None:
+    async def deliver(self, command: CronDeliveryCommand) -> dict[str, Any]:
         """Run one delivery under the target channel session lock."""
 
+        delivery_result: dict[str, Any] = {"total_tokens": 0}
+
         async def _locked() -> None:
+            nonlocal delivery_result
             if command.fresh_thread:
                 await self._gateway.thread_registry.reset_by_session_key(command.session_key)
             session = self._gateway.require_session(command.agent_id, command.session_key)
@@ -77,21 +81,22 @@ class CronDeliveryService:
                     f"session {command.session_key!r} does not belong to user {command.user_id!r}"
                 )
             if command.task_type == "text":
-                await self._deliver_text(command, session)
+                delivery_result = await self._deliver_text(command, session)
             else:
-                await self._deliver_agent(command, session)
+                delivery_result = await self._deliver_agent(command, session)
 
         await self._gateway.run_in_session(
             command.agent_id,
             command.session_key,
             _locked,
         )
+        return delivery_result
 
     async def _deliver_text(
         self,
         command: CronDeliveryCommand,
         session: SessionRow,
-    ) -> None:
+    ) -> dict[str, Any]:
         projected: list[ThreadMessageInput] = []
         title_source = command.prompt
         if session.channel_type == ThreadRegistry.CHANNEL_DASHBOARD:
@@ -130,12 +135,13 @@ class CronDeliveryService:
             title_source=title_source,
         )
         await self._notify_best_effort(session, command.agent_id, command.prompt)
+        return {"total_tokens": 0}
 
     async def _deliver_agent(
         self,
         command: CronDeliveryCommand,
         session: SessionRow,
-    ) -> None:
+    ) -> dict[str, Any]:
         request = await self._build_agent_request(command, session)
         tracker = TurnHistoryTracker.from_request(request)
         usage = UsageTracker()
@@ -150,6 +156,8 @@ class CronDeliveryService:
                 async for chunk in self._agent_manager.stream(command.agent_id, request):
                     tracker.observe(chunk)
                     usage.observe(chunk)
+                    if command.budget_lease is not None:
+                        command.budget_lease.observe(usage.usage or {})
                     kind = chunk.get("type")
                     if kind == "tool_call_chunk":
                         saw_tool_call = True
@@ -183,6 +191,9 @@ class CronDeliveryService:
                 thread_id=session.thread_id,
                 usage=usage.usage,
                 source="cron",
+                trace_id=(
+                    command.budget_lease.trace_id if command.budget_lease is not None else None
+                ),
             )
         await self._gateway.push_session_text(
             session,
@@ -190,6 +201,7 @@ class CronDeliveryService:
             title_source=command.prompt,
         )
         await self._notify_best_effort(session, command.agent_id, outbound)
+        return dict(usage.usage or {})
 
     async def _build_agent_request(
         self,
@@ -351,6 +363,7 @@ def command_from_row(row: Any) -> CronDeliveryCommand:
         task_type=normalize_cron_task_type(str(row.task_type)),
         model=str(row.model) if row.model else None,
         mcp_servers=tuple(str(name) for name in row.mcp_servers),
+        budget_lease=None,
     )
 
 

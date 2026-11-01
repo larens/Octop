@@ -520,6 +520,7 @@ class ProactiveCareScheduler:
                     agent_id,
                     target_session.session_key,
                     can_send=can_send,
+                    user_id=target_session.user_id,
                 )
             except Exception as exc:
                 logger.error(

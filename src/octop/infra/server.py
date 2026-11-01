@@ -552,6 +552,7 @@ class OctopServer:
         gateway.set_slash_meta(version=__version__, started_at=started_at)
         self._started_at = started_at
 
+        from octop.infra.conversation.budget import RouterBudgetGate  # noqa: PLC0415
         from octop.infra.cron.delivery import CronDeliveryService  # noqa: PLC0415
 
         cron_delivery = CronDeliveryService(
@@ -586,6 +587,12 @@ class OctopServer:
             care_push_repo=self.services.repos.care_push_repo,
             agent_manager=registry,
             timezone=config.default_timezone,
+            budget_gate=RouterBudgetGate(
+                self.services.repos.db,
+                self.services.repos.settings_repo,
+                timezone_name=config.default_timezone,
+            ),
+            usage_repo=self.services.repos.usage_repo,
         )
         proactive_scheduler = ProactiveCareScheduler(
             care_service=care_service,

@@ -100,11 +100,15 @@ class ProactiveCareService:
         care_push_repo: CarePushRepo,
         agent_manager: AgentManager,
         timezone: str = "Asia/Shanghai",
+        budget_gate: Any | None = None,
+        usage_repo: Any | None = None,
     ) -> None:
         self._gateway = gateway
         self._care_push_repo = care_push_repo
         self._agent_manager = agent_manager
         self._timezone = timezone or "Asia/Shanghai"
+        self._budget_gate = budget_gate
+        self._usage_repo = usage_repo
         self._picker = EpisodePicker(
             top_k=3,
             window_days=_DEFAULT_WINDOW_DAYS,
@@ -121,6 +125,7 @@ class ProactiveCareService:
         session_key: str,
         *,
         can_send: Callable[[], bool] | None = None,
+        user_id: int | None = None,
     ) -> None:
         """Run one proactive care push.
 
@@ -134,6 +139,9 @@ class ProactiveCareService:
         logger.info(
             "ProactiveCareService: starting push agent=%s session=%s", agent_id, session_key
         )
+        if user_id is None:
+            parts = session_key.split(":", 3)
+            user_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
 
         # 1. Get the Memory instance
         try:
@@ -237,6 +245,25 @@ class ProactiveCareService:
 
         # 6. Call the LLM to generate the care message
         episode_context = _format_episodes_for_prompt(pick_result.episodes)
+        from octop.infra.conversation.budget import estimate_tokens  # noqa: PLC0415
+
+        estimated_input = estimate_tokens(system_prompt) + estimate_tokens(episode_context)
+        budget_lease = None
+        if self._budget_gate is not None and user_id > 0:
+            try:
+                budget_lease = self._budget_gate.start(
+                    surface="proactive",
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    source_id=f"proactive:{agent_id}",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ProactiveCareService: router budget blocked agent=%s: %s",
+                    agent_id,
+                    exc,
+                )
+                return
         try:
             llm = agent.model_factory.get(agent.config.pick_default_model_ref())
             messages = [
@@ -254,11 +281,36 @@ class ProactiveCareService:
                 care_text[:50] + "..." if len(care_text) > 50 else care_text,
             )
         except Exception as exc:
+            if budget_lease is not None:
+                budget_lease.finish(actual_tokens=estimated_input, failed=True)
             logger.warning("ProactiveCareService: LLM call failed agent=%s: %s", agent_id, exc)
             return  # do not push, do not write a record
 
+        actual_tokens = estimated_input + estimate_tokens(care_text)
+        if self._usage_repo is not None and user_id > 0:
+            try:
+                thread_id = self._gateway.thread_registry.get_bound_thread_id(session_key) or ""
+                self._usage_repo.record(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    model=str(agent.config.pick_default_model_ref() or ""),
+                    input_tokens=estimated_input,
+                    output_tokens=max(0, actual_tokens - estimated_input),
+                    source="proactive",
+                    trace_id=budget_lease.trace_id if budget_lease is not None else None,
+                )
+            except Exception:
+                logger.warning(
+                    "ProactiveCareService: usage record failed agent=%s",
+                    agent_id,
+                    exc_info=True,
+                )
+
         # 7. Push the message directly without invoking the agent.
         if can_send is not None and not can_send():
+            if budget_lease is not None:
+                budget_lease.finish(actual_tokens=actual_tokens, failed=True)
             logger.info(
                 "ProactiveCareService: user activity changed during generation, discarding agent=%s",
                 agent_id,
@@ -267,6 +319,8 @@ class ProactiveCareService:
         try:
             await self._gateway.push_text_from_session(agent_id, session_key, care_text)
         except Exception as exc:
+            if budget_lease is not None:
+                budget_lease.finish(actual_tokens=actual_tokens, failed=True)
             logger.warning(
                 "ProactiveCareService: push failed agent=%s session=%s: %s",
                 agent_id,
@@ -274,6 +328,8 @@ class ProactiveCareService:
                 exc,
             )
             return  # do not write a record
+        if budget_lease is not None:
+            budget_lease.finish(actual_tokens=actual_tokens, failed=False)
 
         # 8. Write the dedup record (only after a successful push)
         episode_ids = [ep.id for ep in pick_result.episodes]

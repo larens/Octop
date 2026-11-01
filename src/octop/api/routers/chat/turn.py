@@ -18,6 +18,7 @@ from octop_gateway.models import (
 from octop.api.common.agent import require_agent_row
 from octop.api.common.validators import validate_chat_mcp_servers, validate_chat_skills
 from octop.api.routers.chat.models import ChatTurnBody
+from octop.infra.conversation.shadow import maybe_schedule_shadow_router
 from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.gateway.media.attachment_hints import (
     inbound_attachments_from_parts,
@@ -296,6 +297,20 @@ async def prepare_dashboard_turn(
     )
     inbound_content = content_parts_from_dashboard_turn(turn)
     inbound_attachments = inbound_attachments_from_parts(inbound_content)
+    # Router Phase 0 observes a bounded context pack without changing turn execution.
+    maybe_schedule_shadow_router(
+        server,
+        agent_id=agent_id,
+        user_id=user.id,
+        thread_id=thread_id,
+        session_key=session_key,
+        text=_turn_plain_text(turn),
+        has_attachments=bool(inbound_attachments),
+        target_agent_ids=tuple(target_ids or ()),
+        knowledge_base_ids=(
+            tuple(turn.knowledge_base_ids) if turn.knowledge_base_ids is not None else None
+        ),
+    )
     return PreparedDashboardTurn(
         thread_id=thread_id,
         session_key=session_key,
