@@ -440,7 +440,8 @@ def test_shadow_budget_reports_block_without_consuming_or_stopping_work(db: Sqli
         MemorySettings(
             {
                 "router.budget.mode": "shadow",
-                "router.budget.user_daily_tokens": "10",
+                "router.budget.user_daily_tokens": "5",
+                "router.budget.run_tokens.cron": "10",
             }
         ),
         timezone_name="Asia/Shanghai",
@@ -456,7 +457,7 @@ def test_shadow_budget_reports_block_without_consuming_or_stopping_work(db: Sqli
     assert lease.reservations == []
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM budget_ledgers").fetchone()[0] == 0
-    lease.finish(actual_tokens=5)
+    lease.finish(actual_tokens=25)
 
     events = ConversationService(db).list_events(
         agent_id="agent-a",
@@ -469,7 +470,11 @@ def test_shadow_budget_reports_block_without_consuming_or_stopping_work(db: Sqli
         "budget.shadow_settled",
     ]
     assert events[0]["status"] == "would_block"
-    assert events[1]["usage"] == {"total_tokens": 5}
+    assert events[1]["usage"] == {"total_tokens": 25}
+    assert events[1]["payload"]["actual_tokens"] == 25
+    assert events[1]["payload"]["estimated_tokens"] == 10
+    assert events[1]["payload"]["enforced_tokens"] == 10
+    assert events[1]["payload"]["overrun_tokens"] == 15
 
 
 def test_shadow_evaluation_errors_never_block_work() -> None:
