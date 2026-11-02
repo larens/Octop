@@ -592,8 +592,10 @@ class RouterBudgetGate:
                 "scope_id": item["scope_id"],
                 "period_start": item["period_start"],
                 "period_end": item["period_end"],
-                "reserved_tokens": item["reserved_tokens"],
-                "reserved_cost_micros": item["reserved_cost_micros"],
+                "reserved_tokens": item.get("reservation_tokens", item["reserved_tokens"]),
+                "reserved_cost_micros": item.get(
+                    "reservation_cost_micros", item["reserved_cost_micros"]
+                ),
                 "spent_tokens": enforced_tokens,
                 "spent_cost_micros": actual_cost,
             }

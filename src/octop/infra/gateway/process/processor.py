@@ -987,6 +987,10 @@ class GlobalProcessor:
         channel_type = msg.channel_type or "unknown"
         im_meta = session_metadata_from_message(msg)
         meta = msg.metadata or {}
+        usage_source = str(meta.get("usage_source") or "chat")
+        usage_trace_id = str(meta.get("trace_id") or "").strip() or None
+        usage_task_id = str(meta.get("task_id") or "").strip() or None
+        usage_run_id = str(meta.get("run_id") or "").strip() or None
         locale = resolve_user_locale(
             user_repo=self._user_repo,
             user_id=user_id,
@@ -1305,6 +1309,10 @@ class GlobalProcessor:
                 user_id=user_id,
                 thread_id=thread_id,
                 usage=usage_tracker.usage,
+                source=usage_source,
+                trace_id=usage_trace_id,
+                task_id=usage_task_id,
+                run_id=usage_run_id,
             )
             await self._record_turn_history(thread_id, history_tracker)
         yield _maybe_stamp_team_host(self._done_chunk(thread_id), agent_id, team_host)
@@ -1739,6 +1747,10 @@ class GlobalProcessor:
         user_id: int,
         thread_id: str,
         usage: dict[str, Any] | None,
+        source: str = "chat",
+        trace_id: str | None = None,
+        task_id: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         if self._usage_repo is None or not usage:
             return
@@ -1748,6 +1760,10 @@ class GlobalProcessor:
             user_id=user_id,
             thread_id=thread_id,
             usage=usage,
+            source=source,
+            trace_id=trace_id,
+            task_id=task_id,
+            run_id=run_id,
         )
 
     async def _persist_incomplete_turn(

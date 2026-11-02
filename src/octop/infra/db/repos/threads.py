@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from octop.infra.db.pool import DatabasePool
 from octop.infra.db.repos._base import DbRow, bool_int, map_rows, now_ts
@@ -239,15 +240,27 @@ class ThreadRepo:
         return map_rows(rows, ThreadRow)
 
     def list_by_agent_user(
-        self, *, agent_id: str, user_id: int, limit: int = 50
+        self,
+        *,
+        agent_id: str,
+        user_id: int,
+        limit: int = 50,
+        exclude_channel_types: tuple[str, ...] = (),
     ) -> list[ThreadRow]:
+        clauses = ["agent_id = ?", "user_id = ?"]
+        params: list[Any] = [agent_id, user_id]
+        if exclude_channel_types:
+            placeholders = ", ".join("?" for _ in exclude_channel_types)
+            clauses.append(f"channel_type NOT IN ({placeholders})")
+            params.extend(exclude_channel_types)
+        params.append(limit)
         with self._db.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM threads WHERE agent_id = ? AND user_id = ? "
+                f"SELECT * FROM threads WHERE {' AND '.join(clauses)} "
                 "ORDER BY pinned DESC, "
                 "CASE WHEN last_active > 0 THEN last_active ELSE created_at END DESC, "
                 "thread_id DESC LIMIT ?",
-                (agent_id, user_id, limit),
+                tuple(params),
             ).fetchall()
         return map_rows(rows, ThreadRow)
 

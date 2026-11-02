@@ -16,6 +16,7 @@ class ThreadRegistry:
     CHANNEL_DASHBOARD = "dashboard"
     CHANNEL_CLI = "cli"
     CHANNEL_MCP = "mcp"
+    CHANNEL_WORKER = "worker"
     CHAT_TYPE_DM = "dm"
     CHAT_TYPE_GROUP = "group"
 
@@ -26,6 +27,7 @@ class ThreadRegistry:
             cls.CHANNEL_DASHBOARD,
             cls.CHANNEL_CLI,
             cls.CHANNEL_MCP,
+            cls.CHANNEL_WORKER,
         }
 
     @classmethod
@@ -109,6 +111,16 @@ class ThreadRegistry:
             channel_type=ThreadRegistry.CHANNEL_MCP,
             channel_subject_id=str(user_id),
             channel_chat_type=f"call-{call_id}",
+        )
+
+    @staticmethod
+    def worker_key(*, agent_id: str, task_id: str, run_id: str) -> str:
+        """Return the isolated, hidden Thread key for one attempted Worker Run."""
+        return ThreadRegistry.make_key(
+            agent_id=agent_id,
+            channel_type=ThreadRegistry.CHANNEL_WORKER,
+            channel_subject_id=task_id,
+            channel_chat_type=run_id,
         )
 
     def __init__(self, *, session_repo: SessionRepo, thread_repo: ThreadRepo) -> None:
@@ -434,7 +446,12 @@ class ThreadRegistry:
         return self._threads.get(thread_id)
 
     def list_threads(self, *, agent_id: str, user_id: int, limit: int = 50) -> list[ThreadRow]:
-        return self._threads.list_by_agent_user(agent_id=agent_id, user_id=user_id, limit=limit)
+        return self._threads.list_by_agent_user(
+            agent_id=agent_id,
+            user_id=user_id,
+            limit=limit,
+            exclude_channel_types=(self.CHANNEL_WORKER,),
+        )
 
     def list_threads_for_session(self, *, session_key: str, limit: int = 50) -> list[ThreadRow]:
         return self._threads.list_by_session(session_key=session_key, limit=limit)

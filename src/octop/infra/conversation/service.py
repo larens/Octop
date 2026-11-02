@@ -307,9 +307,11 @@ class ConversationService:
         priority: int = 0,
         requires_user: bool = False,
         expires_at: int | None = None,
+        capsule: Any = None,
     ) -> dict[str, Any]:
         task_id = _new_id("task")
         now = _now()
+        capsule_json = _json_text(capsule, default={}) if capsule is not None else "{}"
         with self._db.transaction() as conn:
             conversation = conn.execute(
                 "SELECT conversation_id FROM main_conversations WHERE conversation_id = ?",
@@ -321,7 +323,7 @@ class ConversationService:
                 "INSERT INTO conversation_tasks("
                 "task_id, conversation_id, task_type, title, subject_key, objective, status, "
                 "requires_user, capsule_json, priority, created_at, updated_at, expires_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, 'open', ?, '{}', ?, ?, ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     conversation_id,
@@ -330,6 +332,7 @@ class ConversationService:
                     _clip(subject_key, 500),
                     _clip(objective, MAX_TEXT_CHARS),
                     1 if requires_user else 0,
+                    capsule_json,
                     int(priority),
                     now,
                     now,
@@ -341,6 +344,90 @@ class ConversationService:
             ).fetchone()
         assert row is not None
         return _task_payload(row, runs=[])
+
+    def create_read_only_task(
+        self,
+        *,
+        conversation_id: str,
+        title: str,
+        subject_key: str,
+        objective: str,
+        capsule: Any,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        priority: int = 0,
+        available_at: int = 0,
+    ) -> dict[str, Any]:
+        """Atomically deduplicate and queue one read-only task and its first Run."""
+        if max_attempts < 1 or max_attempts > HARD_MAX_ATTEMPTS:
+            raise RouterPhase0Error(f"max_attempts must be between 1 and {HARD_MAX_ATTEMPTS}")
+        now = _now()
+        task_id = _new_id("task")
+        run_id = _new_id("run")
+        capsule_json = _json_text(capsule, default={})
+        clipped_subject = _clip(subject_key, 500)
+        with self._db.transaction() as conn:
+            conversation = conn.execute(
+                "SELECT conversation_id FROM main_conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise NotFoundError("main conversation not found")
+            existing = conn.execute(
+                "SELECT * FROM conversation_tasks "
+                "WHERE conversation_id = ? AND task_type = 'read_only' AND subject_key = ? "
+                "AND status IN ('needs_user', 'in_progress', 'open') "
+                "ORDER BY priority DESC, updated_at DESC LIMIT 1",
+                (conversation_id, clipped_subject),
+            ).fetchone()
+            if existing is not None:
+                run_rows = conn.execute(
+                    "SELECT * FROM task_runs WHERE task_id = ? ORDER BY attempt_no DESC",
+                    (_row_value(existing, "task_id"),),
+                ).fetchall()
+                return {
+                    "task": _task_payload(existing),
+                    "runs": [_run_payload(row) for row in run_rows],
+                    "deduplicated": True,
+                }
+            conn.execute(
+                "INSERT INTO conversation_tasks("
+                "task_id, conversation_id, task_type, title, subject_key, objective, status, "
+                "requires_user, capsule_json, priority, created_at, updated_at, expires_at"
+                ") VALUES (?, ?, 'read_only', ?, ?, ?, 'open', 0, ?, ?, ?, ?, NULL)",
+                (
+                    task_id,
+                    conversation_id,
+                    _clip(title, 200),
+                    clipped_subject,
+                    _clip(objective, MAX_TEXT_CHARS),
+                    capsule_json,
+                    int(priority),
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_runs("
+                "run_id, task_id, worker_thread_id, status, attempt_no, lease_until, created_at"
+                ") VALUES (?, ?, NULL, 'queued', 1, ?, ?)",
+                (run_id, task_id, max(now, int(available_at or 0)), now),
+            )
+            conn.execute(
+                "UPDATE conversation_tasks SET status = 'in_progress', updated_at = ? "
+                "WHERE task_id = ?",
+                (now, task_id),
+            )
+            task_row = conn.execute(
+                "SELECT * FROM conversation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            run_row = conn.execute("SELECT * FROM task_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if task_row is None or run_row is None:
+            raise RouterPhase0Error("failed to create the read-only task")
+        return {
+            "task": _task_payload(task_row),
+            "runs": [_run_payload(run_row)],
+            "deduplicated": False,
+        }
 
     def transition_task(
         self,
@@ -381,6 +468,7 @@ class ConversationService:
         task_id: str,
         worker_thread_id: str | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        available_at: int = 0,
     ) -> dict[str, Any]:
         if max_attempts < 1 or max_attempts > HARD_MAX_ATTEMPTS:
             raise RouterPhase0Error(f"max_attempts must be between 1 and {HARD_MAX_ATTEMPTS}")
@@ -404,9 +492,16 @@ class ConversationService:
                 raise RetryLimitExceededError(f"task {task_id} exhausted {max_attempts} attempts")
             conn.execute(
                 "INSERT INTO task_runs("
-                "run_id, task_id, worker_thread_id, status, attempt_no, created_at"
-                ") VALUES (?, ?, ?, 'queued', ?, ?)",
-                (run_id, task_id, worker_thread_id, next_attempt, now),
+                "run_id, task_id, worker_thread_id, status, attempt_no, lease_until, created_at"
+                ") VALUES (?, ?, ?, 'queued', ?, ?, ?)",
+                (
+                    run_id,
+                    task_id,
+                    worker_thread_id,
+                    next_attempt,
+                    max(now, int(available_at or 0)),
+                    now,
+                ),
             )
             if task_status in {"open", "needs_user"}:
                 conn.execute(
@@ -417,6 +512,184 @@ class ConversationService:
             row = conn.execute("SELECT * FROM task_runs WHERE run_id = ?", (run_id,)).fetchone()
         assert row is not None
         return _run_payload(row)
+
+    def get_run(self, *, run_id: str) -> dict[str, Any]:
+        with self._db.connect() as conn:
+            row = conn.execute("SELECT * FROM task_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("run not found")
+        return _run_payload(row)
+
+    def claim_next_read_only_run(
+        self,
+        *,
+        now: int,
+        lease_seconds: int,
+    ) -> dict[str, Any] | None:
+        """Atomically claim one due read-only Run and return its task/context."""
+        lease_until = int(now) + max(1, int(lease_seconds))
+        with self._db.transaction() as conn:
+            row = conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'running',
+                       started_at = COALESCE(started_at, ?),
+                       last_progress_at = ?,
+                       lease_until = ?
+                 WHERE run_id = (
+                       SELECT r.run_id
+                         FROM task_runs r
+                         JOIN conversation_tasks t ON t.task_id = r.task_id
+                        WHERE r.status = 'queued'
+                          AND COALESCE(r.lease_until, 0) <= ?
+                          AND t.task_type = 'read_only'
+                          AND t.status IN ('open', 'in_progress')
+                          AND t.requires_user = 0
+                          AND (t.expires_at IS NULL OR t.expires_at > ?)
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM task_runs active
+                               WHERE active.task_id = r.task_id
+                                 AND active.run_id <> r.run_id
+                                 AND active.status IN ('queued', 'running', 'waiting_user')
+                          )
+                        ORDER BY t.priority DESC, r.created_at ASC
+                        LIMIT 1
+                 )
+                   AND status = 'queued'
+                RETURNING *
+                """,
+                (now, now, lease_until, now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            run = _run_payload(row)
+            task_row = conn.execute(
+                "SELECT * FROM conversation_tasks WHERE task_id = ?",
+                (run["task_id"],),
+            ).fetchone()
+            if task_row is None:
+                raise NotFoundError("claimed task not found")
+            task = _task_payload(task_row)
+            conversation_row = conn.execute(
+                "SELECT * FROM main_conversations WHERE conversation_id = ?",
+                (task["conversation_id"],),
+            ).fetchone()
+            if conversation_row is None:
+                raise NotFoundError("claimed conversation not found")
+        return {
+            "run": run,
+            "task": task,
+            "conversation": _conversation_payload(conversation_row),
+        }
+
+    def bind_run_worker_thread(self, *, run_id: str, worker_thread_id: str) -> dict[str, Any]:
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE task_runs SET worker_thread_id = ?, last_progress_at = ? "
+                "WHERE run_id = ? AND status = 'running'",
+                (worker_thread_id, _now(), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidTransitionError("run is no longer running")
+            row = conn.execute("SELECT * FROM task_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("run not found")
+        return _run_payload(row)
+
+    def renew_run_lease(self, *, run_id: str, lease_until: int) -> bool:
+        """Extend a live lease. A false result means another actor ended the Run."""
+        now = _now()
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE task_runs SET lease_until = ?, last_progress_at = ? "
+                "WHERE run_id = ? AND status = 'running'",
+                (int(lease_until), now, run_id),
+            )
+        return bool(cursor.rowcount == 1)
+
+    def recover_expired_runs(self, *, now: int) -> list[dict[str, Any]]:
+        """Mark leases lost by a crashed process as interrupted, without retry loops."""
+        with self._db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_runs "
+                "WHERE status = 'running' AND lease_until IS NOT NULL AND lease_until <= ? "
+                "ORDER BY created_at ASC",
+                (now,),
+            ).fetchall()
+            recovered: list[dict[str, Any]] = []
+            for row in rows:
+                run_id = str(_row_value(row, "run_id"))
+                cursor = conn.execute(
+                    "UPDATE task_runs SET status = 'interrupted', failure_class = ?, "
+                    "finished_at = ?, last_progress_at = ?, lease_until = NULL "
+                    "WHERE run_id = ? AND status = 'running'",
+                    ("lease_expired", now, now, run_id),
+                )
+                if cursor.rowcount == 1:
+                    updated = conn.execute(
+                        "SELECT * FROM task_runs WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+                    if updated is not None:
+                        recovered.append(_run_payload(updated))
+            return recovered
+
+    def list_resumable_read_only_tasks(
+        self,
+        *,
+        now: int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Find interrupted tasks that have no queued/running attempt."""
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.*
+                  FROM conversation_tasks t
+                 WHERE t.task_type = 'read_only'
+                   AND t.status = 'in_progress'
+                   AND t.requires_user = 0
+                   AND (t.expires_at IS NULL OR t.expires_at > ?)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_runs r
+                        WHERE r.task_id = t.task_id
+                          AND r.status IN ('queued', 'running', 'waiting_user')
+                   )
+                 ORDER BY t.priority DESC, t.updated_at ASC
+                 LIMIT ?
+                """,
+                (now, max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [_task_payload(row) for row in rows]
+
+    def cancel_task(self, *, task_id: str) -> dict[str, Any]:
+        now = _now()
+        with self._db.transaction() as conn:
+            task_row = conn.execute(
+                "SELECT * FROM conversation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if task_row is None:
+                raise NotFoundError("task not found")
+            status = str(_row_value(task_row, "status"))
+            if status in TERMINAL_TASK_STATUSES:
+                return _task_payload(task_row)
+            conn.execute(
+                "UPDATE conversation_tasks SET status = 'cancelled', updated_at = ? "
+                "WHERE task_id = ?",
+                (now, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET status = 'cancelled', failure_class = ?, "
+                "finished_at = ?, last_progress_at = ?, lease_until = NULL "
+                "WHERE task_id = ? AND status IN ('queued', 'running', 'waiting_user')",
+                ("user_cancelled", now, now, task_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM conversation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        if updated is None:
+            raise NotFoundError("task not found")
+        return _task_payload(updated)
 
     def transition_run(
         self,
@@ -534,6 +807,29 @@ class ConversationService:
                 (task_id,),
             ).fetchall()
         return _task_payload(row, runs=[_run_payload(run) for run in run_rows])
+
+    def get_task_context(self, *, task_id: str) -> dict[str, Any]:
+        """Internal queue lookup: task plus owning conversation, without user scoping."""
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT t.*, c.agent_id AS owner_agent_id, c.user_id AS owner_user_id "
+                "FROM conversation_tasks t "
+                "JOIN main_conversations c ON c.conversation_id = t.conversation_id "
+                "WHERE t.task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("task not found")
+            run_rows = conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY attempt_no DESC",
+                (task_id,),
+            ).fetchall()
+        return {
+            "task": _task_payload(row),
+            "agent_id": str(_row_value(row, "owner_agent_id")),
+            "user_id": int(_row_value(row, "owner_user_id")),
+            "runs": [_run_payload(run) for run in run_rows],
+        }
 
     def append_event(
         self,
@@ -779,6 +1075,21 @@ class ConversationService:
         assert row is not None
         return _context_pack_payload(row)
 
+    def get_context_pack(
+        self,
+        *,
+        conversation_id: str,
+        pack_id: str,
+    ) -> dict[str, Any]:
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM context_pack_manifests WHERE pack_id = ? AND conversation_id = ?",
+                (pack_id, conversation_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("context pack not found")
+        return _context_pack_payload(row)
+
     def _ensure_budget_ledger(
         self,
         conn: Any,
@@ -1005,7 +1316,13 @@ class ConversationService:
                     (scope_type, scope_id, period_start, period_end),
                 ).fetchone()
                 assert row is not None
-                results.append(_budget_payload(row))
+                result = _budget_payload(row)
+                # Ledger balances are cumulative across concurrent reservations.
+                # Settlement must release only this caller's reservation, not the
+                # aggregate balance observed after the UPDATE.
+                result["reservation_tokens"] = tokens
+                result["reservation_cost_micros"] = cost_micros
+                results.append(result)
         return results
 
     def release_budget(
@@ -1233,6 +1550,14 @@ class ConversationService:
                     run_id,
                 ),
             )
+
+    def has_usage_for_run(self, *, run_id: str) -> bool:
+        with self._db.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM usage_log WHERE run_id = ? LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return row is not None
 
     def sum_usage_tokens(
         self,

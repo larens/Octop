@@ -291,6 +291,7 @@ class AppRuntime:
     trajectory_service: TrajectoryService | None = None
     history_archive: Any | None = None
     bridge_manager: Any | None = None
+    router_worker_service: Any | None = None
 
     def replace_services(self, services: SharedServices, config: OctopConfig) -> None:
         """Retarget all runtime singletons onto a new SharedServices / config.
@@ -313,6 +314,8 @@ class AppRuntime:
             from octop.infra.history.trajectory.store import TrajectoryStore  # noqa: PLC0415
 
             self.trajectory_service.replace_store(TrajectoryStore(services.trajectory_event_repo))
+        if self.router_worker_service is not None:
+            self.router_worker_service.retarget_services(services)
 
 
 class OctopServer:
@@ -654,6 +657,11 @@ class OctopServer:
             history_archive=history_archive,
             bridge_manager=bridge_mgr,
         )
+        from octop.infra.conversation.orchestrator import RouterWorkerService  # noqa: PLC0415
+
+        router_worker_service = RouterWorkerService(self)
+        self.app_runtime.router_worker_service = router_worker_service
+        await router_worker_service.start()
         from octop.infra.knowledge.gate import (  # noqa: PLC0415
             warn_if_local_embedding_deps_missing,
         )
@@ -769,6 +777,8 @@ class OctopServer:
             await agently_auth.close()
             if self.app_runtime is not None:
                 rt = self.app_runtime
+                if rt.router_worker_service is not None:
+                    await rt.router_worker_service.shutdown()
                 await rt.proactive_scheduler.shutdown()
                 await rt.cron_manager.shutdown()
                 await rt.gateway.shutdown()

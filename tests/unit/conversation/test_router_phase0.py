@@ -7,6 +7,7 @@ import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -438,6 +439,66 @@ def test_multi_scope_budget_reservation_rolls_back_atomically(db: SqlitePool) ->
             (period["period_start"], period["period_end"]),
         ).fetchall()
     assert list(rows) == []
+
+
+def test_concurrent_budget_reservations_settle_their_own_deltas(db: SqlitePool) -> None:
+    service = ConversationService(db)
+    period = {"period_start": 100, "period_end": 200}
+
+    def reserve(run_id: str) -> list[dict[str, Any]]:
+        return service.reserve_budgets(
+            [
+                {
+                    "scope_type": "run",
+                    "scope_id": run_id,
+                    "tokens": 50,
+                    "cost_micros": 50_000,
+                    "limit_tokens": 50,
+                    "limit_cost_micros": 50_000,
+                    **period,
+                },
+                {
+                    "scope_type": "task_daily",
+                    "scope_id": "shared-task",
+                    "tokens": 50,
+                    "cost_micros": 50_000,
+                    "limit_tokens": 200,
+                    "limit_cost_micros": 200_000,
+                    **period,
+                },
+            ]
+        )
+
+    first = reserve("run-1")
+    second = reserve("run-2")
+    assert second[1]["reserved_tokens"] == 100
+
+    def settle(reservations: list[dict[str, Any]], actual: int) -> None:
+        service.settle_budgets(
+            [
+                {
+                    "scope_type": item["scope_type"],
+                    "scope_id": item["scope_id"],
+                    "period_start": item["period_start"],
+                    "period_end": item["period_end"],
+                    "reserved_tokens": item["reservation_tokens"],
+                    "reserved_cost_micros": item["reservation_cost_micros"],
+                    "spent_tokens": actual,
+                    "spent_cost_micros": actual * 1_000,
+                }
+                for item in reservations
+            ]
+        )
+
+    settle(first, 10)
+    settle(second, 20)
+    shared = service.get_budget(
+        scope_type="task_daily",
+        scope_id="shared-task",
+        **period,
+    )
+    assert shared["reserved_tokens"] == 0
+    assert shared["spent_tokens"] == 30
 
 
 def test_shadow_budget_reports_block_without_consuming_or_stopping_work(db: SqlitePool) -> None:
