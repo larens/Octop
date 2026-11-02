@@ -13,6 +13,11 @@ import pytest
 
 from octop.infra.conversation.budget import RouterBudgetGate
 from octop.infra.conversation.context import compile_context_pack, estimate_text_tokens
+from octop.infra.conversation.evaluation import (
+    ClassificationSample,
+    evaluate_classifier,
+    evaluate_low_confidence_with_llm,
+)
 from octop.infra.conversation.retention import run_retention
 from octop.infra.conversation.service import (
     BudgetExceededError,
@@ -42,6 +47,7 @@ ROUTER_ENV_KEYS = (
     "OCTOP_ROUTER_BUDGET_USER_DAILY_TOKENS",
     "OCTOP_ROUTER_BUDGET_AGENT_DAILY_TOKENS",
     "OCTOP_ROUTER_BUDGET_GLOBAL_DAILY_TOKENS",
+    "OCTOP_ROUTER_BUDGET_TASK_DAILY_TOKENS",
     "OCTOP_ROUTER_BUDGET_COST_PER_1K_TOKENS_MICROS",
 )
 
@@ -475,6 +481,112 @@ def test_shadow_budget_reports_block_without_consuming_or_stopping_work(db: Sqli
     assert events[1]["payload"]["estimated_tokens"] == 10
     assert events[1]["payload"]["enforced_tokens"] == 10
     assert events[1]["payload"]["overrun_tokens"] == 15
+
+
+def test_task_budget_shadow_reuses_usage_across_attempts(db: SqlitePool) -> None:
+    service = ConversationService(db)
+    gate = RouterBudgetGate(
+        db,
+        MemorySettings(
+            {
+                "router.budget.mode": "shadow",
+                "router.budget.run_tokens.cron": "10",
+                "router.budget.task_daily_tokens.cron": "35",
+            }
+        ),
+        timezone_name="Asia/Shanghai",
+        service=service,
+    )
+
+    first = gate.start(
+        surface="cron",
+        agent_id="agent-a",
+        user_id=1,
+        source_id="same-job",
+    )
+    assert first.task_key == "cron:same-job"
+    first.finish(actual_tokens=30)
+    service.record_usage(
+        agent_id="agent-a",
+        user_id=1,
+        source="cron",
+        total_tokens=30,
+        trace_id=first.trace_id,
+        task_id=first.task_key,
+    )
+
+    second = gate.start(
+        surface="cron",
+        agent_id="agent-a",
+        user_id=1,
+        source_id="same-job",
+    )
+    events = service.list_events(
+        agent_id="agent-a",
+        user_id=1,
+        conversation_id=second.conversation_id,
+        include_payload=True,
+    )
+    latest_check = next(
+        event for event in reversed(events) if event["event_type"] == "budget.shadow_checked"
+    )
+    task_check = next(
+        check for check in latest_check["payload"]["checks"] if check["scope_type"] == "task_daily"
+    )
+    assert task_check["scope_id"] == "cron:same-job"
+    assert task_check["baseline_tokens"] == 30
+    assert task_check["would_block"]
+    assert second.would_block
+
+
+def test_classifier_evaluation_reports_side_effect_miss_rate() -> None:
+    metrics = evaluate_classifier(
+        [
+            ClassificationSample("你好", "direct_reply"),
+            ClassificationSample("帮我看一下明天的日历", "read_only_task"),
+            ClassificationSample("please handle the thing", "side_effect_task"),
+        ]
+    )
+
+    assert metrics["total"] == 3
+    assert metrics["side_effect_total"] == 1
+    assert metrics["side_effect_missed"] == 1
+    assert metrics["side_effect_miss_rate"] == 1.0
+    assert not metrics["dispatch_enabled"]
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_llm_evaluation_has_independent_budget() -> None:
+    calls = 0
+
+    async def classify(text: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {
+            "intent": "side_effect_task",
+            "confidence": 0.9,
+            "tokens": 400,
+            "dispatch_enabled": False,
+        }
+
+    samples = [
+        ClassificationSample("please handle the thing", "side_effect_task"),
+        ClassificationSample("look at that later", "read_only_task"),
+        ClassificationSample("maybe deal with it", "side_effect_task"),
+    ]
+    metrics = await evaluate_low_confidence_with_llm(
+        samples,
+        classify,
+        max_calls=1,
+        token_budget=400,
+        estimated_tokens_per_call=400,
+    )
+
+    assert calls == 1
+    assert metrics["second_stage_calls"] == 1
+    assert metrics["second_stage_estimated_tokens"] <= metrics["second_stage_token_budget"]
+    assert metrics["second_stage_skipped_for_budget"] >= 1
+    assert not metrics["dispatch_enabled"]
 
 
 def test_shadow_evaluation_errors_never_block_work() -> None:

@@ -299,6 +299,7 @@ class ProactiveCareService:
                     output_tokens=max(0, actual_tokens - estimated_input),
                     source="proactive",
                     trace_id=budget_lease.trace_id if budget_lease is not None else None,
+                    task_id=budget_lease.task_key if budget_lease is not None else None,
                 )
             except Exception:
                 logger.warning(

@@ -42,6 +42,12 @@ SURFACE_DAILY_TOKEN_DEFAULTS = {
     "proactive": 30_000,
     "worker": 240_000,
 }
+TASK_DAILY_TOKEN_DEFAULTS = {
+    "interactive": 160_000,
+    "cron": 120_000,
+    "proactive": 60_000,
+    "worker": 120_000,
+}
 USER_DAILY_TOKEN_DEFAULT = 400_000
 AGENT_DAILY_TOKEN_DEFAULT = 600_000
 GLOBAL_DAILY_TOKEN_DEFAULT = 2_000_000
@@ -52,6 +58,7 @@ _ENV_KEYS = {
     "user_daily_tokens": "OCTOP_ROUTER_BUDGET_USER_DAILY_TOKENS",
     "agent_daily_tokens": "OCTOP_ROUTER_BUDGET_AGENT_DAILY_TOKENS",
     "global_daily_tokens": "OCTOP_ROUTER_BUDGET_GLOBAL_DAILY_TOKENS",
+    "task_daily_tokens": "OCTOP_ROUTER_BUDGET_TASK_DAILY_TOKENS",
     "cost_per_1k_tokens_micros": "OCTOP_ROUTER_BUDGET_COST_PER_1K_TOKENS_MICROS",
 }
 
@@ -138,6 +145,7 @@ class BudgetConfig:
     mode: str
     enforced_surfaces: frozenset[str]
     run_tokens: int
+    task_daily_tokens: int
     surface_daily_tokens: int
     user_daily_tokens: int
     agent_daily_tokens: int
@@ -160,6 +168,7 @@ class BudgetLease:
     reservations: list[dict[str, Any]]
     estimated_tokens: int
     created_at: int
+    task_key: str = ""
     actual_tokens: int = 0
     _finished: bool = field(default=False, init=False)
     _overflow: bool = field(default=False, init=False)
@@ -226,6 +235,11 @@ class RouterBudgetGate:
                 f"run_tokens.{normalized}",
                 RUN_TOKEN_DEFAULTS[normalized],
             ),
+            task_daily_tokens=_setting_int(
+                self._settings,
+                f"task_daily_tokens.{normalized}",
+                TASK_DAILY_TOKEN_DEFAULTS[normalized],
+            ),
             surface_daily_tokens=_setting_int(
                 self._settings,
                 f"daily_tokens.{normalized}",
@@ -265,6 +279,7 @@ class RouterBudgetGate:
         config = self.config_for(normalized_surface)
         enforced = config.mode == "enforce" and normalized_surface in config.enforced_surfaces
         trace_id = f"{normalized_surface}:{source_id}:{uuid.uuid4().hex}"
+        task_key = f"{normalized_surface}:{source_id}"
         now = int(time.time())
         try:
             conversation = self._service.ensure_main_conversation(
@@ -295,6 +310,7 @@ class RouterBudgetGate:
                 reservations=[],
                 estimated_tokens=config.run_tokens,
                 created_at=now,
+                task_key=task_key,
             )
 
         estimate = config.run_tokens
@@ -311,6 +327,18 @@ class RouterBudgetGate:
                 "limit_tokens": config.run_tokens,
                 "limit_cost_micros": (
                     config.run_tokens * config.cost_per_1k_tokens_micros // 1_000
+                ),
+            },
+            {
+                "scope_type": "task_daily",
+                "scope_id": task_key,
+                "period_start": day_start,
+                "period_end": day_end,
+                "tokens": estimate,
+                "cost_micros": cost_micros,
+                "limit_tokens": config.task_daily_tokens,
+                "limit_cost_micros": (
+                    config.task_daily_tokens * config.cost_per_1k_tokens_micros // 1_000
                 ),
             },
             {
@@ -376,6 +404,7 @@ class RouterBudgetGate:
                     payload={
                         "surface": normalized_surface,
                         "mode": config.mode,
+                        "task_key": task_key,
                         "reason": str(exc),
                         "estimated_tokens": estimate,
                     },
@@ -395,6 +424,7 @@ class RouterBudgetGate:
                 reservations=reservations,
                 estimated_tokens=estimate,
                 created_at=now,
+                task_key=task_key,
             )
             self._append_budget_event(
                 conversation_id=lease.conversation_id,
@@ -423,8 +453,14 @@ class RouterBudgetGate:
             for spec in specs:
                 scope_type = str(spec["scope_type"])
                 baseline_tokens = 0
-                if scope_type != "run":
-                    if scope_type == "surface_daily":
+                if scope_type not in {"run"}:
+                    if scope_type == "task_daily":
+                        baseline_tokens = self._service.sum_usage_tokens(
+                            period_start=int(spec["period_start"]),
+                            period_end=int(spec["period_end"]),
+                            task_id=task_key,
+                        )
+                    elif scope_type == "surface_daily":
                         baseline_tokens = self._service.sum_usage_tokens(
                             period_start=int(spec["period_start"]),
                             period_end=int(spec["period_end"]),
@@ -485,6 +521,7 @@ class RouterBudgetGate:
             reservations=[],
             estimated_tokens=estimate,
             created_at=now,
+            task_key=task_key,
         )
         self._append_budget_event(
             conversation_id=lease.conversation_id,
@@ -505,6 +542,7 @@ class RouterBudgetGate:
             payload={
                 "surface": normalized_surface,
                 "mode": config.mode,
+                "task_key": task_key,
                 "estimated_tokens": estimate,
                 "would_block": bool(blocked),
                 "checks": checks,
@@ -532,6 +570,7 @@ class RouterBudgetGate:
                 payload={
                     "surface": lease.surface,
                     "mode": lease.mode,
+                    "task_key": lease.task_key,
                     "actual_tokens": actual,
                     "estimated_tokens": lease.estimated_tokens,
                     "enforced_tokens": enforced_tokens,
@@ -591,6 +630,7 @@ class RouterBudgetGate:
             payload={
                 "surface": lease.surface,
                 "mode": lease.mode,
+                "task_key": lease.task_key,
                 "actual_tokens": enforced_tokens,
                 "overflow": lease._overflow,
             },

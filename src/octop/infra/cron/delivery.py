@@ -194,6 +194,9 @@ class CronDeliveryService:
                 trace_id=(
                     command.budget_lease.trace_id if command.budget_lease is not None else None
                 ),
+                task_id=(
+                    command.budget_lease.task_key if command.budget_lease is not None else None
+                ),
             )
         await self._gateway.push_session_text(
             session,

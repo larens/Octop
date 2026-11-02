@@ -12,6 +12,8 @@ import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from octop.infra.conversation.context import MAX_OMITTED_REFS
+
 TASK_STATUSES = frozenset(
     {"open", "in_progress", "needs_user", "done", "failed", "cancelled", "expired"}
 )
@@ -207,6 +209,14 @@ def _budget_payload(row: Any) -> dict[str, Any]:
 
 
 def _context_pack_payload(row: Any) -> dict[str, Any]:
+    omitted = _json_value(_row_value(row, "omitted_refs_json"), default=[])
+    omitted_refs = omitted if isinstance(omitted, list) else []
+    omitted_by_reason: dict[str, int] = {}
+    for item in omitted_refs:
+        if not isinstance(item, Mapping):
+            continue
+        reason = str(item.get("reason") or "unknown")
+        omitted_by_reason[reason] = omitted_by_reason.get(reason, 0) + 1
     return {
         "pack_id": str(_row_value(row, "pack_id")),
         "conversation_id": str(_row_value(row, "conversation_id")),
@@ -216,7 +226,10 @@ def _context_pack_payload(row: Any) -> dict[str, Any]:
         "used_tokens": _int_value(row, "used_tokens"),
         "sections": _json_value(_row_value(row, "sections_json"), default=[]),
         "included_refs": _json_value(_row_value(row, "included_refs_json"), default=[]),
-        "omitted_refs": _json_value(_row_value(row, "omitted_refs_json"), default=[]),
+        "omitted_refs": omitted_refs,
+        "omitted_count": len(omitted_refs),
+        "omitted_by_reason": dict(sorted(omitted_by_reason.items())),
+        "omitted_refs_truncated": len(omitted_refs) >= MAX_OMITTED_REFS,
         "created_at": _int_value(row, "created_at"),
     }
 
@@ -1229,6 +1242,7 @@ class ConversationService:
         agent_id: str | None = None,
         user_id: int | None = None,
         source: str | None = None,
+        task_id: str | None = None,
     ) -> int:
         """Read actual token usage for shadow budget comparisons."""
         clauses = ["ts >= ?", "ts < ?"]
@@ -1242,6 +1256,9 @@ class ConversationService:
         if source is not None:
             clauses.append("source = ?")
             params.append(source)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
         with self._db.connect() as conn:
             row = conn.execute(
                 "SELECT COALESCE(SUM(total_tokens), 0) AS total_tokens FROM usage_log "
