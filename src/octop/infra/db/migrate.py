@@ -2056,6 +2056,20 @@ def _apply_postgresql_migration(conn: Any, sql: str) -> None:
         conn.execute(stmt)
 
 
+def _apply_sqlite_additive_migration(db: DatabasePool, path: Path) -> None:
+    """Apply additive migrations that may be replayed after a version reset."""
+    sql = path.read_text(encoding="utf-8")
+    with db.transaction() as conn:
+        for stmt in (part.strip() for part in _SQL_STMT_RE.split(sql)):
+            if not stmt:
+                continue
+            try:
+                conn.execute(stmt)
+            except Exception as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+
+
 def _apply_sqlite_migration(db: DatabasePool, version: int, path: Path) -> None:
     """Apply one SQLite migration.
 
@@ -2230,6 +2244,18 @@ def _apply_sqlite_migration(db: DatabasePool, version: int, path: Path) -> None:
         _ensure_router_phase0_schema(db)
         with db.connect() as conn:
             conn.execute("UPDATE _schema_version SET version = ?", (version,))
+        return
+    additive_table = {
+        26: "conversation_tasks",
+        27: "dispatch_plans",
+        28: "conversation_tasks",
+    }
+    if version in additive_table:
+        if not _table_exists(db, additive_table[version]):
+            with db.connect() as conn:
+                conn.execute("UPDATE _schema_version SET version = ?", (version,))
+            return
+        _apply_sqlite_additive_migration(db, path)
         return
     sql = path.read_text(encoding="utf-8")
     with db.connect() as conn:

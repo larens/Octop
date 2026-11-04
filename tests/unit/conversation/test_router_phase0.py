@@ -165,7 +165,7 @@ def test_v24_upgrade_backfills_latest_dashboard_thread(tmp_path: Path) -> None:
         usage_columns = {
             column["name"] for column in conn.execute("PRAGMA table_info(usage_log)").fetchall()
         }
-    assert version == 25
+    assert version == 28
     assert row is not None
     assert row["router_thread_id"] == "new-dashboard"
     assert {"trace_id", "task_id", "run_id"}.issubset(usage_columns)
