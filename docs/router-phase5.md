@@ -92,3 +92,40 @@ Phase 5 的观测正是长期方案里「Router 层上下文、追踪与成本�
   无限重试带来的 token 账单失控。
 - **保留**：`router.retention.*` 把 Context Pack、事件、账本约束在可回收窗口内，
   配合最近讨论/短期记忆/长期知识库抽取，避免信息量与上下文无限累积。
+
+## 验收与结项（2026-11-05）
+
+前置（Phase 0/3/3.5/4/5）已全部完成，本次完成 Phase 5 生产验收与结项。
+
+**生产状态**
+
+- 蓝绿：`current = 1.0.2-20261105-095728`（active），`previous = 1.0.2-20261104-140650`（回滚路径保留）。
+- 服务：`octop` `ActiveState=active`、`NRestarts=0`；本地 `127.0.0.1:8088/api/health` 与公网均 `ok:true`，schema 34。
+- 开关：`router.*` settings 为空；Phase 5 只读，未开 `router.side_effect_writes.enabled` /
+  `router.worker_dispatch.enabled` / `router.budget.mode=enforce`。
+- 新端点：`/api/admin/observability/router/summary`、`/router/health` 已上生产，无 token 返回 401（已挂载且受 ACL 保护）。
+
+**最终验收（只读跑真实 `RouterObservabilityService` 对生产库 `mode=ro` 汇总）**
+
+```
+status: healthy（reasons: []）
+settings: worker_dispatch_enabled=null, side_effect_writes_enabled=null, budget_mode="shadow"
+counts:  events_total=213 / events_window(24h)=36
+        context_packs_total=21, main_conversations=2,
+        usage_tokens_window(24h)=22,420,248
+        tasks/runs/approvals/receipts/plans = 0（dispatch/write 未开，符合设计）
+health: stale_running_runs=0, processing_write_receipts=0,
+        budget_ledgers_over_limit=0, shadow_would_block_recent=0, budget_blocked_recent=0
+```
+
+**验收结论**
+
+- `RouterObservabilityService.health()` 返回 `healthy`、无告警原因。
+- real 生产数据为生：212/213 条事件、21 个 Context Pack、近 24h 约 2242 万 usage token，
+  预算账本 0 超限、无陈旧租约 / 未完结回执 / 近期 would-block —— 印证 Phase 5 只读观测无副作用。
+- 按门禁判为**通过**：Phase 5 完成生产验收，可结项。
+
+**范围说明**
+
+- Phase 6（enforce / 自动 Worker）**不在本次结项范围**，需另行决策后再启动。
+- 结项后保留 `previous = 1.0.2-20261104-140650` 作为回滚目标，随时可 `octop-bluegreen rollback`。
