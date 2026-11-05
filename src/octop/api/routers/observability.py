@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
 from octop.api.deps import get_server, require_permission
+from octop.infra.conversation.observability import RouterObservabilityService
 
 router = APIRouter()
 
@@ -85,3 +86,28 @@ async def test_langfuse_connection(
             secret_key=body.secret_key,
         ),
     )
+
+
+def _router_observability(server: Any) -> RouterObservabilityService:
+    if server.services is None:
+        raise RuntimeError("server services are unavailable")
+    return RouterObservabilityService(server.services.db)
+
+
+@router.get("/router/summary", summary="Get Router operations summary")
+async def get_router_summary(
+    window_minutes: int = Query(default=1_440, ge=1, le=10_080),
+    _: Any = Depends(require_permission("observability")),
+    server: Any = Depends(get_server),
+) -> dict[str, Any]:
+    """Aggregate Router events, budgets, Context Packs and ledger totals."""
+    return _router_observability(server).summary(window_minutes=window_minutes)
+
+
+@router.get("/router/health", summary="Get Router operations health")
+async def get_router_health(
+    _: Any = Depends(require_permission("observability")),
+    server: Any = Depends(get_server),
+) -> dict[str, Any]:
+    """Report stale leases, abandoned writes, budget breaches and switches."""
+    return _router_observability(server).health()

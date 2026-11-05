@@ -19,6 +19,11 @@ COMMANDS: dict[str, tuple[str, str, str]] = {
     "channel": (".commands.channel", "channel", "Channel management commands."),
     "cron": (".commands.cron", "cron", "Cron job management commands."),
     "provider": (".commands.provider", "provider", "Provider management (admin write)."),
+    "router-obs": (
+        ".commands.router_obs",
+        "router_obs_group",
+        "Router operations telemetry (summary and health).",
+    ),
     "models": (".commands.models", "models", "Provider presets and resolved models."),
     "skills": (".commands.skills", "skills", "Per-agent skill enable/disable."),
     "admin": (".commands.admin", "admin", "Admin commands."),
